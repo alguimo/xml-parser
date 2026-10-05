@@ -1,0 +1,19 @@
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Entornos virtuales
+.venv/
+.venv-build*/
+venv/
+env/
+
+# Artefactos de build
+build/
+dist/
+*.spec.bak
