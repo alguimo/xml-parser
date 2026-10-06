@@ -1,12 +1,22 @@
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 from typing import Optional
 
-from app.extractor import extract_bundle
-from app.parser import parse_patient_xml
-from app.pdf_generator import generate_pdf
+from app.config_store import AppConfig, load_config, save_config
+from app.conversion_service import convert_zip
+from app.folder_watcher import (
+    EVENT_ERROR,
+    EVENT_IGNORED,
+    EVENT_INACCESSIBLE,
+    EVENT_SUCCESS,
+    POLL_INTERVAL_MS,
+    FolderWatcher,
+    WatcherEvent,
+    scan_zip_entries,
+)
 
 APP_TITLE = "Convertisseur ZIP en PDF"
 DROP_HINT = "Déposez un fichier ZIP ici"
@@ -15,13 +25,26 @@ CHECKBOX_LABEL = "Inclure les antécédents"
 SETTINGS_LABEL = "Paramètres"
 CONVERT_LABEL = "Convertir"
 OUTPUT_FOLDER_LABEL = "Dossier de destination"
-DND_UNAVAILABLE = "drag & drop indisponible"
-DND_PICK = "Ou cliquez pour choisir le fichier"
+WATCHED_FOLDER_LABEL = "Dossier surveillé"
+WATCH_TOGGLE_LABEL = "Conversion automatique"
+CHOOSE_LABEL = "Choisir…"
 CHOOSE_ZIP_TITLE = "Choisir le fichier ZIP (export WEDA)"
 CHOOSE_FOLDER_TITLE = "Choisir le dossier de destination"
+CHOOSE_WATCHED_TITLE = "Choisir le dossier à surveiller"
+WATCHED_NONE = "Aucun dossier sélectionné"
+WATCH_DIR_REQUIRED = "Veuillez choisir un dossier à surveiller valide."
+OUTPUT_DIR_REQUIRED = "Veuillez choisir un dossier de destination valide."
 CONVERT_OK = "PDF généré:\n"
 CONVERT_KO = "Conversion impossible:\n"
 NO_ZIP = "Aucun fichier ZIP sélectionné"
+WATCH_STATE_ON = "Vigilance activée"
+WATCH_STATE_OFF = "Vigilance désactivée"
+WATCH_SUCCESS = "Conversion automatique réussie:\n"
+WATCH_ERROR = "Échec de la conversion automatique:\n"
+WATCH_IGNORED = "ZIP ignoré (pas d'export WEDA):\n"
+WATCH_INACCESSIBLE = "Dossier inaccessible. Nouvelle tentative…"
+DND_UNAVAILABLE = "drag & drop indisponible"
+DND_PICK = "Ou cliquez pour choisir le fichier"
 
 
 class SettingsModal(ctk.CTkToplevel):
@@ -29,20 +52,73 @@ class SettingsModal(ctk.CTkToplevel):
         super().__init__(master)
         self.title(SETTINGS_LABEL)
         self.resizable(False, False)
+        self.master_app = master
 
-        ctk.CTkLabel(self, text=OUTPUT_FOLDER_LABEL).pack(padx=24, pady=(20, 5))
+        ctk.CTkLabel(self, text=WATCHED_FOLDER_LABEL).pack(padx=24, pady=(20, 5))
+        self.watched_label = ctk.CTkLabel(
+            self, text=str(master.watched_dir) if master.watched_dir else WATCHED_NONE
+        )
+        self.watched_label.pack(padx=24)
+        watched_row = ctk.CTkFrame(self, fg_color="transparent")
+        watched_row.pack(pady=8)
+        ctk.CTkButton(
+            watched_row, text=CHOOSE_LABEL, command=self._pick_watched
+        ).pack(side="left", padx=6)
+
+        ctk.CTkLabel(self, text=OUTPUT_FOLDER_LABEL).pack(padx=24, pady=(12, 5))
         self.folder_label = ctk.CTkLabel(self, text=str(master.output_dir))
         self.folder_label.pack(padx=24)
         row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(pady=16)
-        ctk.CTkButton(row, text="Choisir…", command=lambda: self._pick(master)).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="OK", command=self.destroy).pack(side="left", padx=6)
+        row.pack(pady=8)
+        ctk.CTkButton(
+            row, text=CHOOSE_LABEL, command=self._pick_output
+        ).pack(side="left", padx=6)
 
-    def _pick(self, master: "App") -> None:
-        chosen = filedialog.askdirectory(initialdir=str(master.output_dir))
+        self.watch_toggle = ctk.CTkCheckBox(
+            self, text=WATCH_TOGGLE_LABEL, command=self._toggle_watch
+        )
+        if master.watch_enabled:
+            self.watch_toggle.select()
+        self.watch_toggle.pack(pady=(14, 6))
+
+        ctk.CTkButton(self, text="OK", command=self.destroy).pack(pady=(6, 20))
+
+    def _pick_watched(self) -> None:
+        initial = str(self.master_app.watched_dir or Path.home())
+        chosen = filedialog.askdirectory(
+            title=CHOOSE_WATCHED_TITLE, initialdir=initial
+        )
         if chosen:
-            master.output_dir = Path(chosen)
+            self.master_app.watched_dir = Path(chosen)
+            self.watched_label.configure(text=chosen)
+            self.master_app.persist_config()
+            self.master_app.restart_watch()
+
+    def _pick_output(self) -> None:
+        chosen = filedialog.askdirectory(
+            title=CHOOSE_FOLDER_TITLE, initialdir=str(self.master_app.output_dir)
+        )
+        if chosen:
+            self.master_app.output_dir = Path(chosen)
             self.folder_label.configure(text=chosen)
+            self.master_app.persist_config()
+            self.master_app.restart_watch()
+
+    def _toggle_watch(self) -> None:
+        if not self.watch_toggle.get():
+            self.master_app.disable_watch()
+            return
+        if not self.master_app.watched_dir_valid():
+            messagebox.showwarning(APP_TITLE, WATCH_DIR_REQUIRED)
+            self.watch_toggle.deselect()
+            self._pick_watched()
+            return
+        if not self.master_app.output_dir_valid():
+            messagebox.showwarning(APP_TITLE, OUTPUT_DIR_REQUIRED)
+            self.watch_toggle.deselect()
+            self._pick_output()
+            return
+        self.master_app.enable_watch()
 
 
 class App(ctk.CTk):
@@ -50,8 +126,13 @@ class App(ctk.CTk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("520x340")
-        self.output_dir = Path.home() / "Desktop"
+        config = load_config()
+        self.output_dir = config.output_dir or (Path.home() / "Desktop")
+        self.watched_dir: Optional[Path] = config.watched_dir
+        self.watch_enabled: bool = config.watch_enabled
         self.zip_path: Optional[str] = None
+        self.watcher: Optional[FolderWatcher] = None
+        self._tick_job: Optional[str] = None
 
         self.drop_zone = ctk.CTkButton(
             self,
@@ -66,12 +147,23 @@ class App(ctk.CTk):
         )
         self.drop_zone.pack(padx=30, pady=24, fill="x")
 
-        self.include_antecedents = ctk.CTkCheckBox(self, text=CHECKBOX_LABEL)
+        self.include_antecedents = ctk.CTkCheckBox(
+            self, text=CHECKBOX_LABEL, command=self.on_include_antecedents_change
+        )
         self.include_antecedents.select()
         self.include_antecedents.pack(pady=4)
 
         self.status = ctk.CTkLabel(self, text="", text_color="grey")
         self.status.pack(pady=2)
+
+        self.watch_state = ctk.CTkLabel(
+            self, text=WATCH_STATE_OFF, text_color="grey"
+        )
+        self.watch_state.pack(pady=2)
+        self.watch_status = ctk.CTkLabel(
+            self, text="", text_color="grey", wraplength=460, justify="left"
+        )
+        self.watch_status.pack(pady=2)
 
         button_row = ctk.CTkFrame(self, fg_color="transparent")
         button_row.pack(pady=12)
@@ -83,6 +175,9 @@ class App(ctk.CTk):
         ).pack(side="left", padx=5)
 
         self._setup_drag_and_drop()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.watch_enabled:
+            self.start_watch()
 
     def _setup_drag_and_drop(self) -> None:
         try:
@@ -116,17 +211,118 @@ class App(ctk.CTk):
     def open_settings(self) -> None:
         SettingsModal(self)
 
+    def persist_config(self) -> None:
+        save_config(
+            AppConfig(
+                watched_dir=self.watched_dir,
+                output_dir=self.output_dir,
+                watch_enabled=self.watch_enabled,
+            )
+        )
+
+    def watched_dir_valid(self) -> bool:
+        return self.watched_dir is not None and self.watched_dir.is_dir()
+
+    def output_dir_valid(self) -> bool:
+        return self.output_dir is not None and self.output_dir.is_dir()
+
+    def start_watch(self) -> None:
+        self._stop_watch()
+        self._set_watch_indicator()
+        if self.watched_dir is None:
+            messagebox.showwarning(APP_TITLE, WATCH_DIR_REQUIRED)
+            return
+        try:
+            backlog = set(scan_zip_entries(self.watched_dir))
+        except OSError:
+            backlog = set()
+        self.watcher = FolderWatcher(
+            self.watched_dir,
+            self.output_dir,
+            bool(self.include_antecedents.get()),
+        )
+        self.watcher.start(backlog)
+        self._tick_job = self.after(POLL_INTERVAL_MS, self.tick)
+
+    def restart_watch(self) -> None:
+        if self.watch_enabled:
+            self.start_watch()
+
+    def enable_watch(self) -> None:
+        self.watch_enabled = True
+        self.persist_config()
+        self.start_watch()
+
+    def disable_watch(self) -> None:
+        self.watch_enabled = False
+        self.persist_config()
+        self._stop_watch()
+
+    def _stop_watch(self) -> None:
+        if self._tick_job is not None:
+            self.after_cancel(self._tick_job)
+            self._tick_job = None
+        if self.watcher is not None:
+            self.watcher.stop()
+            self.watcher = None
+        self._set_watch_indicator()
+
+    def _set_watch_indicator(self) -> None:
+        if self.watch_enabled:
+            self.watch_state.configure(text=WATCH_STATE_ON, text_color="#27ae60")
+        else:
+            self.watch_state.configure(text=WATCH_STATE_OFF, text_color="grey")
+
+    def tick(self) -> None:
+        self._tick_job = None
+        if self.watcher is None:
+            return
+        try:
+            self.watcher.poll()
+            for event in self.watcher.drain_events():
+                self._handle_event(event)
+        finally:
+            # Keep the cycle alive even if one tick fails; the error still surfaces.
+            if self.watcher is not None:
+                self._tick_job = self.after(POLL_INTERVAL_MS, self.tick)
+
+    def _handle_event(self, event: WatcherEvent) -> None:
+        if event.kind == EVENT_SUCCESS:
+            text = f"{WATCH_SUCCESS}{event.pdf or event.path}"
+            color = "#27ae60"
+        elif event.kind == EVENT_ERROR:
+            text = f"{WATCH_ERROR}{event.path}\n{event.message}"
+            color = "#c0392b"
+        elif event.kind == EVENT_IGNORED:
+            text = f"{WATCH_IGNORED}{event.path}"
+            color = "#b9770e"
+        elif event.kind == EVENT_INACCESSIBLE:
+            text = WATCH_INACCESSIBLE
+            color = "#c0392b"
+        else:
+            return
+        self.watch_status.configure(text=text, text_color=color)
+
+    def on_include_antecedents_change(self) -> None:
+        if self.watcher is not None:
+            self.watcher.set_include_antecedents(
+                bool(self.include_antecedents.get())
+            )
+
+    def on_close(self) -> None:
+        self._stop_watch()
+        self.destroy()
+
     def convert(self) -> None:
         if not self.zip_path:
             self.status.configure(text=NO_ZIP, text_color="#c0392b")
             return
         try:
-            bundle = extract_bundle(Path(self.zip_path))
-            record = parse_patient_xml(bundle.xml_bytes)
-            output = generate_pdf(
-                record,
+            output = convert_zip(
+                Path(self.zip_path),
                 self.output_dir,
-                include_antecedents=bool(self.include_antecedents.get()),
+                bool(self.include_antecedents.get()),
+                datetime.now(),
             )
             self.status.configure(text=str(output), text_color="#27ae60")
             messagebox.showinfo(APP_TITLE, f"{CONVERT_OK}{output}")
