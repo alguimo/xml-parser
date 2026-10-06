@@ -51,7 +51,7 @@ class SettingsModal(ctk.CTkToplevel):
     def __init__(self, master: "App") -> None:
         super().__init__(master)
         self.title(SETTINGS_LABEL)
-        self.resizable(False, False)
+        self.transient(master)
         self.master_app = master
 
         ctk.CTkLabel(self, text=WATCHED_FOLDER_LABEL).pack(padx=24, pady=(20, 5))
@@ -82,6 +82,10 @@ class SettingsModal(ctk.CTkToplevel):
         self.watch_toggle.pack(pady=(14, 6))
 
         ctk.CTkButton(self, text="OK", command=self.destroy).pack(pady=(6, 20))
+
+        self.update_idletasks()
+        self.geometry(f"{self.winfo_reqwidth()}x{self.winfo_reqheight()}")
+        self.resizable(True, True)
 
     def _pick_watched(self) -> None:
         initial = str(self.master_app.watched_dir or Path.home())
@@ -125,7 +129,6 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("520x340")
         config = load_config()
         self.output_dir = config.output_dir or (Path.home() / "Desktop")
         self.watched_dir: Optional[Path] = config.watched_dir
@@ -178,6 +181,13 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         if self.watch_enabled:
             self.start_watch()
+
+        self.update_idletasks()
+        width = max(520, self.winfo_reqwidth())
+        height = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
+        self.geometry(f"{width}x{height}")
+        self.minsize(520, 300)
+        self.resizable(True, True)
 
     def _setup_drag_and_drop(self) -> None:
         try:
