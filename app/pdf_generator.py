@@ -1,5 +1,8 @@
-from datetime import datetime
+import os
+import tempfile
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
@@ -380,65 +383,82 @@ def generate_pdf(
     record: PatientRecord,
     output_dir: Path,
     include_antecedents: bool = True,
+    today: Optional[date] = None,
 ) -> Path:
     styles = _styles()
     p = record.patient
-    filename = output_filename(
-        p.last_name or "Patient", p.first_name or "", datetime.now().date()
-    )
+    today = today or date.today()
+    filename = output_filename(p.last_name or "Patient", p.first_name or "", today)
     if not p.last_name and not p.first_name:
-        filename = f"patient_{datetime.now():%d%m%Y}.pdf"
+        filename = f"patient_{today:%d%m%Y}.pdf"
     output_path = output_dir / filename
 
-    doc = BaseDocTemplate(
-        str(output_path),
-        pagesize=A4,
-        leftMargin=LEFT_MARGIN,
-        rightMargin=RIGHT_MARGIN,
-        topMargin=TOP_MARGIN,
-        bottomMargin=BOTTOM_MARGIN,
-        title=f"Rapport patient — {p.full_name or p.last_name}",
-        author=GENERATOR_LABEL,
-    )
-    frame = Frame(
-        LEFT_MARGIN,
-        BOTTOM_MARGIN,
-        CONTENT_WIDTH,
-        CONTENT_HEIGHT,
-        id="body",
-        leftPadding=0,
-        rightPadding=0,
-        topPadding=0,
-        bottomPadding=0,
-    )
-    doc.addPageTemplates([PageTemplate(id="body", frames=[frame], onPage=_footer)])
-
-    patient_blocks = _patient_blocks(p, styles)
-
-    main: list = [
-        Paragraph(p.full_name or p.last_name, styles["title"]),
-        Spacer(1, 6),
-    ]
-    if patient_blocks:
-        main.append(Paragraph(BLOCK_PATIENT, styles["section"]))
-        main.extend(patient_blocks)
-
-    side: list = []
-    if include_antecedents and record.antecedents:
-        side.append(Paragraph(BLOCK_ANTECEDENTS, styles["section"]))
-        side.extend(_antecedent_blocks(record.antecedents, styles))
-
-    treatment = [Paragraph(BLOCK_TREATMENT, styles["section"])]
-    treatment.extend(_treatment_blocks(record, styles))
-    has_prescriptions = any(c.prescriptions for c in record.consultations)
-    if side or has_prescriptions:
-        side.extend(treatment)
-    else:
-        main.extend(treatment)
-
-    main.append(Paragraph(BLOCK_CONSULTATIONS, styles["section"]))
-    main.extend(_consultation_blocks(record, styles))
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    doc.build(_two_column_layout(main, side, CONTENT_HEIGHT))
+    # Build next to the final file so os.replace stays atomic and same-filesystem.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=output_dir, prefix=f".{filename}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        doc = BaseDocTemplate(
+            str(tmp_path),
+            pagesize=A4,
+            leftMargin=LEFT_MARGIN,
+            rightMargin=RIGHT_MARGIN,
+            topMargin=TOP_MARGIN,
+            bottomMargin=BOTTOM_MARGIN,
+            title=f"Rapport patient — {p.full_name or p.last_name}",
+            author=GENERATOR_LABEL,
+        )
+        frame = Frame(
+            LEFT_MARGIN,
+            BOTTOM_MARGIN,
+            CONTENT_WIDTH,
+            CONTENT_HEIGHT,
+            id="body",
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+        )
+        doc.addPageTemplates(
+            [PageTemplate(id="body", frames=[frame], onPage=_footer)]
+        )
+
+        patient_blocks = _patient_blocks(p, styles)
+
+        main: list = [
+            Paragraph(p.full_name or p.last_name, styles["title"]),
+            Spacer(1, 6),
+        ]
+        if patient_blocks:
+            main.append(Paragraph(BLOCK_PATIENT, styles["section"]))
+            main.extend(patient_blocks)
+
+        side: list = []
+        if include_antecedents and record.antecedents:
+            side.append(Paragraph(BLOCK_ANTECEDENTS, styles["section"]))
+            side.extend(_antecedent_blocks(record.antecedents, styles))
+
+        treatment = [Paragraph(BLOCK_TREATMENT, styles["section"])]
+        treatment.extend(_treatment_blocks(record, styles))
+        has_prescriptions = any(c.prescriptions for c in record.consultations)
+        if side or has_prescriptions:
+            side.extend(treatment)
+        else:
+            main.extend(treatment)
+
+        main.append(Paragraph(BLOCK_CONSULTATIONS, styles["section"]))
+        main.extend(_consultation_blocks(record, styles))
+
+        doc.build(_two_column_layout(main, side, CONTENT_HEIGHT))
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     return output_path
