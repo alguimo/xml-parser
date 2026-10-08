@@ -1,3 +1,12 @@
+"""Render a `PatientRecord` as the two-column A4 PDF report.
+
+The page has a wide left column (patient data, then consultations) and a narrow
+right column (medical history and the consolidated treatment list). Both columns
+flow in parallel and are paginated by hand with `_paginate`, NOT by ReportLab:
+a single very tall row makes ReportLab's `splitInRow` return an empty top part
+and retry forever, so we control page breaks ourselves.
+"""
+
 import os
 import tempfile
 from datetime import date
@@ -30,15 +39,16 @@ LEFT_MARGIN = 15 * mm
 CONTENT_WIDTH = A4[0] - LEFT_MARGIN - RIGHT_MARGIN
 CONTENT_HEIGHT = A4[1] - TOP_MARGIN - BOTTOM_MARGIN
 
-SIDE_RATIO = 0.66
+SIDE_RATIO = 0.66  # left column share of the content width; right gets the rest
 COLUMN_PADDING = 4 * mm
-SIDE_RULE = True
+SIDE_RULE = True  # draw the vertical separator between the two columns
 PAGE_SAFETY = 4  # pt kept free so a hand-paginated page never overflows
 MAIN_WIDTH = (CONTENT_WIDTH - 2 * COLUMN_PADDING) * SIDE_RATIO
 SIDE_WIDTH = (CONTENT_WIDTH - 2 * COLUMN_PADDING) * (1 - SIDE_RATIO)
 ENTRY_SEPARATOR = " — "
 ENTRY_INDENT = 3 * mm
 
+# Colour palette shared by headings, rules and tables.
 ACCENT = "#1f3b63"
 ACCENT_MID = "#2f4f7f"
 ACCENT_LIGHT = "#eef2f8"
@@ -75,6 +85,7 @@ GROUP_LABELS = {"Lettre": "Courriers"}
 
 
 def _styles() -> dict[str, ParagraphStyle]:
+    """Build all the paragraph styles used across the report, keyed by role."""
     base = getSampleStyleSheet()
     title = ParagraphStyle(
         "Title2",
@@ -164,6 +175,7 @@ def _styles() -> dict[str, ParagraphStyle]:
 def _table(
     data: list[list], headers: list[str], styles: dict, widths=None
 ) -> Table:
+    """Build a styled table with a header row repeated on every page."""
     rows = [[Paragraph(f"<b>{h}</b>", styles["table_header"]) for h in headers]]
     rows += [[Paragraph(str(c), styles["small"]) for c in row] for row in data]
     table = Table(rows, colWidths=widths, repeatRows=1)
@@ -184,6 +196,7 @@ def _table(
 
 
 def _patient_blocks(p: PatientData, styles: dict) -> list[Paragraph]:
+    """Render the patient's filled-in fields as a two-column label/value table."""
     rows = []
     for key, label in LABELS.items():
         value = getattr(p, key, "")
@@ -196,6 +209,7 @@ def _patient_blocks(p: PatientData, styles: dict) -> list[Paragraph]:
 
 
 def _antecedent_entry(ant: Antecedent, styles: dict) -> list:
+    """Lay out one history entry: bold "Label — CIM10" plus an indented comment."""
     heading = ant.label
     if ant.cim10:
         heading += f'{ENTRY_SEPARATOR}<font color="{ACCENT_MID}">{ant.cim10}</font>'
@@ -208,6 +222,7 @@ def _antecedent_entry(ant: Antecedent, styles: dict) -> list:
 
 
 def _prescription_entry(rx: Prescription, styles: dict) -> list:
+    """Lay out one medication: bold name plus an indented dosage line."""
     blocks = [Paragraph(rx.name, styles["entry_bold"])]
     if rx.dosage:
         blocks.append(Paragraph(rx.dosage, styles["entry_text"]))
@@ -215,10 +230,12 @@ def _prescription_entry(rx: Prescription, styles: dict) -> list:
 
 
 def _antecedent_blocks(antecedents: list[Antecedent], styles: dict) -> list:
+    """Group history entries by category, preserving first-seen order."""
     if not antecedents:
         return [Paragraph(NO_ANTECEDENTS, styles["body"])]
 
     blocks: list = []
+    # Build the ordered list of (category, items) without a pre-sorted dict.
     categories: list[tuple[str, list[Antecedent]]] = []
     order: dict[str, int] = {}
     for ant in antecedents:
@@ -235,6 +252,11 @@ def _antecedent_blocks(antecedents: list[Antecedent], styles: dict) -> list:
 
 
 def _treatment_blocks(record: PatientRecord, styles: dict) -> list:
+    """Consolidated medication list, grouped by consultation date.
+
+    Medications also appear inside each consultation; showing them here too is
+    intentional, not a duplicate.
+    """
     consult_with_rx = [c for c in record.consultations if c.prescriptions]
     if not consult_with_rx:
         return [Paragraph(NO_PRESCRIPTIONS, styles["body"])]
@@ -247,10 +269,16 @@ def _treatment_blocks(record: PatientRecord, styles: dict) -> list:
 
 
 def _consultation_blocks(record: PatientRecord, styles: dict) -> list:
+    """Render every consultation: sections, vitals, fees and attachments.
+
+    Consultations are grouped by kind (consultations first, then letters) and
+    within the group sorted by date (newest first, already done by the parser).
+    """
     consultations = record.consultations
     if not consultations:
         return [Paragraph(NO_CONSULTATIONS, styles["body"])]
 
+    # Distinct kinds in a stable order: Consultation before Lettre before rest.
     kinds = list(dict.fromkeys(c.kind for c in consultations))
     priority = {"Consultation": 0, "Lettre": 1}
     kinds = sorted(
@@ -308,6 +336,7 @@ def _consultation_blocks(record: PatientRecord, styles: dict) -> list:
 
 
 def _footer(canvas, doc) -> None:  # noqa: ANN001
+    """Draw the page number at the bottom-right of every page."""
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
     canvas.drawRightString(A4[0] - RIGHT_MARGIN, 12 * mm, f"Page {doc.page}")
@@ -315,6 +344,13 @@ def _footer(canvas, doc) -> None:  # noqa: ANN001
 
 
 def _paginate(flowables: list, width: float, avail_height: float) -> list[list]:
+    """Split a column's flowables into pages that fit `avail_height`.
+
+    We measure each flowable instead of letting ReportLab decide, because
+    `splitInRow` is unreliable with very tall rows. A flowable taller than a
+    whole page is split into parts; the first part closes the current page and
+    the rest are re-queued at the front.
+    """
     limit = max(avail_height - PAGE_SAFETY, 1)
     pages: list[list] = []
     current: list = []
@@ -324,10 +360,12 @@ def _paginate(flowables: list, width: float, avail_height: float) -> list[list]:
         flow = queue.pop(0)
         _, height = flow.wrap(width, limit)
         space = flow.getSpaceBefore() + flow.getSpaceAfter()
+        # Start a new page if this flowable no longer fits on the current one.
         if current and used + height + space > limit:
             pages.append(current)
             current, used = [], 0.0
         if height > limit:
+            # Taller than a full page: split and push the remainder back.
             room = limit - used
             parts = flow.split(width, room) or flow.split(width, limit)
             if parts and len(parts) > 1:
@@ -344,6 +382,11 @@ def _paginate(flowables: list, width: float, avail_height: float) -> list[list]:
 
 
 def _column_page(main: list, side: list) -> Table:
+    """Wrap one page's two columns in a single borderless row.
+
+    `splitByRow`/`splitInRow` are disabled so ReportLab never tries to split
+    the row itself; pagination was already decided by `_paginate`.
+    """
     style = [
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (0, -1), 0),
@@ -365,8 +408,14 @@ def _column_page(main: list, side: list) -> Table:
 
 
 def _two_column_layout(main: list, side: list, avail_height: float) -> list:
+    """Interleave the two columns page by page into a single story.
+
+    If the right column is empty, the left one is returned as-is so the
+    document falls back to full width.
+    """
     if not side:
         return main
+    # Paginate each column independently, then pair page 1 with page 1, etc.
     main_pages = _paginate(main, MAIN_WIDTH, avail_height)
     side_pages = _paginate(side, SIDE_WIDTH, avail_height)
     story: list = []
@@ -385,6 +434,17 @@ def generate_pdf(
     include_antecedents: bool = True,
     today: Optional[date] = None,
 ) -> Path:
+    """Write the report as a PDF and return its final path.
+
+    The file is built in a temporary file next to the destination and then moved
+    with `os.replace`, so a failure never leaves a half-written PDF behind.
+
+    Args:
+        record: Parsed patient data to render.
+        output_dir: Folder for the PDF (created if missing).
+        include_antecedents: Whether to show the "Antécédents" block.
+        today: Date used in the file name; defaults to the current date.
+    """
     styles = _styles()
     p = record.patient
     today = today or date.today()
@@ -429,6 +489,7 @@ def generate_pdf(
 
         patient_blocks = _patient_blocks(p, styles)
 
+        # Left (wide) column: patient title, patient data, then consultations.
         main: list = [
             Paragraph(p.full_name or p.last_name, styles["title"]),
             Spacer(1, 6),
@@ -437,6 +498,7 @@ def generate_pdf(
             main.append(Paragraph(BLOCK_PATIENT, styles["section"]))
             main.extend(patient_blocks)
 
+        # Right (narrow) column: history (optional) and treatment.
         side: list = []
         if include_antecedents and record.antecedents:
             side.append(Paragraph(BLOCK_ANTECEDENTS, styles["section"]))
@@ -445,6 +507,8 @@ def generate_pdf(
         treatment = [Paragraph(BLOCK_TREATMENT, styles["section"])]
         treatment.extend(_treatment_blocks(record, styles))
         has_prescriptions = any(c.prescriptions for c in record.consultations)
+        # If the right column would be empty, the treatment block goes left and
+        # the document falls back to a single full-width column.
         if side or has_prescriptions:
             side.extend(treatment)
         else:
@@ -454,8 +518,10 @@ def generate_pdf(
         main.extend(_consultation_blocks(record, styles))
 
         doc.build(_two_column_layout(main, side, CONTENT_HEIGHT))
+        # Atomic swap: the final PDF appears in one step.
         os.replace(tmp_path, output_path)
     except BaseException:
+        # Clean up the temp file on any failure, then re-raise.
         try:
             tmp_path.unlink()
         except OSError:

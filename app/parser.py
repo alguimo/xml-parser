@@ -1,3 +1,10 @@
+"""Turn the WEDA Patient.xml into structured Python objects.
+
+`structure.md` documents every field of the XML and is the parser's contract:
+check it before touching this module. The XML has a few known traps we handle
+here (fake dates `01/01/0001`, opaque codes, escaped HTML), all detailed below.
+"""
+
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -7,6 +14,8 @@ from lxml import etree
 
 from app.text_utils import html_to_rich, is_undefined_date
 
+# Opaque code -> readable French label. WEDA stores codes whose meaning depends
+# on context; we only map the ones we can resolve reliably.
 SEX_LABELS = {"1": "Masculin", "2": "Féminin"}
 COMMUNICATION_KINDS = {"0": "Téléphone", "6": "E-mail"}
 EVENT_KINDS = {"1": "Consultation", "3": "Lettre"}
@@ -19,6 +28,8 @@ Fee = Tuple[str, str, str]
 
 @dataclass
 class PatientData:
+    """Identity and contact details shown in the "Données patient" block."""
+
     last_name: str = ""
     first_name: str = ""
     full_name: str = ""
@@ -35,6 +46,8 @@ class PatientData:
 
 @dataclass
 class Antecedent:
+    """One medical history entry (label, optional CIM10 code and comment)."""
+
     category: str
     label: str
     cim10: str = ""
@@ -43,12 +56,16 @@ class Antecedent:
 
 @dataclass
 class Prescription:
+    """One medication: readable name plus dosage text."""
+
     name: str
     dosage: str = ""
 
 
 @dataclass
 class Consultation:
+    """One event (consultation or letter) with all its attached material."""
+
     date: str
     kind: str
     user: str = ""
@@ -62,12 +79,19 @@ class Consultation:
 
 @dataclass
 class PatientRecord:
+    """Everything the PDF needs: the patient, their history and consultations."""
+
     patient: PatientData
     antecedents: list[Antecedent] = field(default_factory=list)
     consultations: list[Consultation] = field(default_factory=list)
 
 
 def parse_patient_xml(xml_bytes: bytes) -> PatientRecord:
+    """Parse the raw Patient.xml bytes into a `PatientRecord`.
+
+    Builds the onglet (tab) title lookup first because antecedents use it to
+    translate their category, then parses each part independently.
+    """
     root = etree.fromstring(xml_bytes)
     onglet_titles = _build_onglet_titles(root)
     patient = _parse_patient(root)
@@ -81,6 +105,11 @@ def parse_patient_xml(xml_bytes: bytes) -> PatientRecord:
 
 
 def _build_onglet_titles(root: etree._Element) -> dict[str, str]:
+    """Map each `OngID` to its readable title from the `<Onglets>` section.
+
+    Antecedents only store an `OngID`; this lookup is how we recover the
+    category name instead of showing an opaque code.
+    """
     titles: dict[str, str] = {}
     for onglet in root.findall("Onglets/Onglet"):
         ong_id = _text(onglet, "OngID")
@@ -91,6 +120,7 @@ def _build_onglet_titles(root: etree._Element) -> dict[str, str]:
 
 
 def _parse_patient(root: etree._Element) -> PatientData:
+    """Extract the patient identity and contact details."""
     def t(path: str) -> str:
         return _text(root, path)
 
@@ -101,8 +131,11 @@ def _parse_patient(root: etree._Element) -> PatientData:
     last_name = t("Nom")
     first_name = t("Prenom")
     full_name = t("NomPrenom") or f"{last_name} {first_name}".strip()
+    # `LabelSexe` is a code; translate it to a French label.
     sex = SEX_LABELS.get(t("LabelSexe"), "")
 
+    # Addresses can repeat: keep the first one that actually has a street, and
+    # reuse the country from any of them.
     address_lines: list[str] = []
     phone = ""
     email = ""
@@ -124,6 +157,7 @@ def _parse_patient(root: etree._Element) -> PatientData:
     else:
         address = ""
 
+    # Communications are also coded; keep the first phone and e-mail.
     for comm in node.findall("Communications/Communication"):
         kind = COMMUNICATION_KINDS.get(_text(comm, "LabelType"))
         value = _text(comm, "Text")
@@ -153,6 +187,7 @@ def _parse_patient(root: etree._Element) -> PatientData:
 def _parse_antecedents(
     root: etree._Element, onglet_titles: dict[str, str]
 ) -> list[Antecedent]:
+    """Read all medical history entries, resolving their category by OngID."""
     antecedents: list[Antecedent] = []
     for node in root.findall("Antecedents/Antecedent"):
         label = _text(node, "Nom")
@@ -172,6 +207,10 @@ def _parse_antecedents(
 
 
 def _date_sort_key(value: str) -> tuple[int, datetime]:
+    """Sort key that pushes unparseable dates to the end.
+
+    Returns a tuple so real dates (flag 1) always sort before invalid ones (0).
+    """
     try:
         return (1, datetime.strptime(value, "%d/%m/%Y"))
     except (TypeError, ValueError):
@@ -179,6 +218,7 @@ def _date_sort_key(value: str) -> tuple[int, datetime]:
 
 
 def _parse_consultations(root: etree._Element) -> list[Consultation]:
+    """Read all events, skip empty/undefined ones and sort newest first."""
     consultations: list[Consultation] = []
     for node in root.findall("Evenements/Evenement"):
         date_value = _clean_date(_text(node, "Date"))
@@ -206,6 +246,7 @@ def _parse_consultations(root: etree._Element) -> list[Consultation]:
             if name:
                 consult.attachments.append(name)
 
+        # Drop events that carry no useful content at all.
         if any(
             (consult.sections, consult.vitals, consult.prescriptions,
              consult.fees, consult.attachments)
@@ -217,6 +258,7 @@ def _parse_consultations(root: etree._Element) -> list[Consultation]:
 
 
 def _fill_document(consult: Consultation, doc: etree._Element) -> None:
+    """Add one document's content (prescriptions, text sections, vitals) in place."""
     prescriptions = doc.findall("Prescriptions/Prescription")
     if prescriptions:
         for pres in prescriptions:
@@ -239,6 +281,7 @@ def _fill_document(consult: Consultation, doc: etree._Element) -> None:
         text = html_to_rich(raw_text)
         if not text:
             continue
+        # Skip meaningless version placeholders like "V1|0|".
         if re.fullmatch(r"\s*V\d+\|\d+\|\s*", text):
             continue
         label = raw_title or (title_default if i == 1 else "")
@@ -254,6 +297,7 @@ def _fill_document(consult: Consultation, doc: etree._Element) -> None:
 
 
 def _text(node: Optional[etree._Element], path: str) -> str:
+    """Safe child lookup: return the stripped text or "" if anything is missing."""
     if node is None:
         return ""
     child = node.find(path)
@@ -263,4 +307,5 @@ def _text(node: Optional[etree._Element], path: str) -> str:
 
 
 def _clean_date(value: str) -> str:
+    """Return "" for the placeholder date, otherwise the value unchanged."""
     return "" if is_undefined_date(value) else value

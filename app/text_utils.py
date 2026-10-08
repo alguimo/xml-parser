@@ -1,3 +1,10 @@
+"""Text helpers for the messy HTML the WEDA export sometimes contains.
+
+The XML often stores escaped HTML (sometimes escaped twice) and CSS colors.
+These helpers turn that into either plain text or a small ReportLab-friendly
+subset of tags (`<b>`, `<i>`, `<u>`, `<font color="...">`, `<sub>`, `<sup>`).
+"""
+
 import html as html_mod
 import re
 from datetime import date
@@ -14,6 +21,11 @@ _HEX_RE = re.compile(r"#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}")
 
 
 def _double_unescape(raw: str) -> str:
+    """Decode HTML entities repeatedly until the text stops changing.
+
+    The export can escape twice (`&amp;#233;` really means `é`), so a single
+    unescape is not enough. We loop a few times and stop when stable.
+    """
     current = raw
     for _ in range(3):
         nxt = html_mod.unescape(current)
@@ -24,11 +36,16 @@ def _double_unescape(raw: str) -> str:
 
 
 def _is_hidden(tag: Tag) -> bool:
+    """Tell whether an element is hidden with `display:none` in its style."""
     style = (tag.get("style") or "").replace(" ", "")
     return "display:none" in style
 
 
 def _extract_color(style: str) -> str:
+    """Pull a color out of a CSS `style` string, normalized to `#rrggbb`.
+
+    Returns an empty string when there is no usable color.
+    """
     match = _COLOR_RE.search(style or "")
     if not match:
         return ""
@@ -46,6 +63,11 @@ def _extract_color(style: str) -> str:
 
 
 def _render_rich(node, out: list[str]) -> None:
+    """Walk the HTML tree and rebuild it as ReportLab mini-markup.
+
+    `out` is an accumulator: each list item is a chunk of text or markup. We
+    drop hidden/script/style content and keep a small set of allowed tags.
+    """
     for child in getattr(node, "children", ()):
         if isinstance(child, NavigableString):
             out.append(html_mod.escape(str(child), quote=False))
@@ -133,6 +155,11 @@ def _render_rich(node, out: list[str]) -> None:
 
 
 def _normalize_rich(text: str) -> str:
+    """Collapse whitespace and drop empty markup pairs.
+
+    Keeps single newlines (they are intentional line breaks) but removes blank
+    lines, repeated spaces and tags that ended up wrapping nothing.
+    """
     text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
@@ -145,7 +172,9 @@ def _normalize_rich(text: str) -> str:
 
 
 def html_to_rich(raw: str) -> str:
+    """Convert raw WEDA HTML into ReportLab markup (or plain text)."""
     soup = BeautifulSoup(_double_unescape(raw), "lxml")
+    # Remove hidden nodes first so their text never reaches the PDF.
     for tag in soup.find_all(True):
         if _is_hidden(tag):
             tag.decompose()
@@ -155,6 +184,7 @@ def html_to_rich(raw: str) -> str:
 
 
 def clean_html(raw: str) -> str:
+    """Return plain text with all tags stripped and whitespace collapsed."""
     soup = BeautifulSoup(_double_unescape(raw), "lxml")
     for tag in soup.find_all(True):
         if _is_hidden(tag):
@@ -163,12 +193,14 @@ def clean_html(raw: str) -> str:
 
 
 def is_undefined_date(value: str) -> bool:
+    """Detect the WEDA placeholder for "no date" (`01/01/0001` or empty)."""
     return value.strip() in ("", "01/01/0001")
 
 
 def output_filename(
     last_name: str, first_name: str, today: Optional[date] = None
 ) -> str:
+    """Build the output name `Nom_Prenom_JJMMAAAA.pdf`."""
     today = today or date.today()
     stamp = today.strftime("%d%m%Y")
     return f"{last_name}_{first_name}_{stamp}.pdf"

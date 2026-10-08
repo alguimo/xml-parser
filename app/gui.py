@@ -1,3 +1,10 @@
+"""CustomTkinter GUI: pick a ZIP, convert it, and optionally watch a folder.
+
+`run()` is the entry point called by `main.py`. The GUI only collects paths and
+settings; the real conversion is delegated to `conversion_service.convert_zip`
+(directly for the button, or through `folder_watcher` for automatic mode).
+"""
+
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -48,6 +55,8 @@ DND_PICK = "Ou cliquez pour choisir le fichier"
 
 
 class SettingsModal(ctk.CTkToplevel):
+    """Modal window to choose the watched/output folders and toggle auto mode."""
+
     def __init__(self, master: "App") -> None:
         super().__init__(master)
         self.title(SETTINGS_LABEL)
@@ -88,6 +97,7 @@ class SettingsModal(ctk.CTkToplevel):
         self.resizable(True, True)
 
     def _pick_watched(self) -> None:
+        """Ask for the folder to watch, then save and restart the watcher."""
         initial = str(self.master_app.watched_dir or Path.home())
         chosen = filedialog.askdirectory(
             title=CHOOSE_WATCHED_TITLE, initialdir=initial
@@ -99,6 +109,7 @@ class SettingsModal(ctk.CTkToplevel):
             self.master_app.restart_watch()
 
     def _pick_output(self) -> None:
+        """Ask for the PDF destination folder, then save and restart watcher."""
         chosen = filedialog.askdirectory(
             title=CHOOSE_FOLDER_TITLE, initialdir=str(self.master_app.output_dir)
         )
@@ -109,9 +120,11 @@ class SettingsModal(ctk.CTkToplevel):
             self.master_app.restart_watch()
 
     def _toggle_watch(self) -> None:
+        """Turn automatic mode on/off, prompting for missing folders first."""
         if not self.watch_toggle.get():
             self.master_app.disable_watch()
             return
+        # Cannot enable without a valid input and output folder: warn and ask.
         if not self.master_app.watched_dir_valid():
             messagebox.showwarning(APP_TITLE, WATCH_DIR_REQUIRED)
             self.watch_toggle.deselect()
@@ -126,9 +139,12 @@ class SettingsModal(ctk.CTkToplevel):
 
 
 class App(ctk.CTk):
+    """Main window: drop zone, options, status labels and action buttons."""
+
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
+        # Load remembered settings; default the output folder to the Desktop.
         config = load_config()
         self.output_dir = config.output_dir or (Path.home() / "Desktop")
         self.watched_dir: Optional[Path] = config.watched_dir
@@ -190,6 +206,7 @@ class App(ctk.CTk):
         self.resizable(True, True)
 
     def _setup_drag_and_drop(self) -> None:
+        """Enable drag & drop if tkinterdnd2 works; otherwise show a hint."""
         try:
             from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -202,11 +219,13 @@ class App(ctk.CTk):
             )
 
     def pick_zip(self) -> None:
+        """Open a file dialog to choose the ZIP (used when clicking the zone)."""
         chosen = filedialog.askopenfilename(title=CHOOSE_ZIP_TITLE, filetypes=[("ZIP", "*.zip")])
         if chosen:
             self.set_zip(chosen)
 
     def on_drop(self, event) -> None:  # noqa: ANN001
+        """Handle a drag & drop; accept only ZIP files."""
         first = event.data.split()[0].strip("{}")
         if first.lower().endswith(".zip"):
             self.set_zip(first)
@@ -214,14 +233,17 @@ class App(ctk.CTk):
             self.status.configure(text="Fichier ZIP attendu", text_color="#c0392b")
 
     def set_zip(self, path: str) -> None:
+        """Remember the chosen ZIP and show its name."""
         self.zip_path = path
         self.drop_zone.configure(text=f"{Path(path).name}")
         self.status.configure(text=path, text_color="grey")
 
     def open_settings(self) -> None:
+        """Open the settings modal window."""
         SettingsModal(self)
 
     def persist_config(self) -> None:
+        """Save the current folders and watch flag to disk."""
         save_config(
             AppConfig(
                 watched_dir=self.watched_dir,
@@ -231,12 +253,19 @@ class App(ctk.CTk):
         )
 
     def watched_dir_valid(self) -> bool:
+        """True if a watched folder is set and still exists."""
         return self.watched_dir is not None and self.watched_dir.is_dir()
 
     def output_dir_valid(self) -> bool:
+        """True if an output folder is set and still exists."""
         return self.output_dir is not None and self.output_dir.is_dir()
 
     def start_watch(self) -> None:
+        """(Re)create the folder watcher and start the polling cycle.
+
+        Existing ZIPs are captured as a "backlog" and skipped, so only files
+        dropped after this point are converted.
+        """
         self._stop_watch()
         self._set_watch_indicator()
         if self.watched_dir is None:
@@ -252,23 +281,28 @@ class App(ctk.CTk):
             bool(self.include_antecedents.get()),
         )
         self.watcher.start(backlog)
+        # Poll the watcher on the Tk event loop (single-threaded access to UI).
         self._tick_job = self.after(POLL_INTERVAL_MS, self.tick)
 
     def restart_watch(self) -> None:
+        """Restart the watcher only if automatic mode is currently enabled."""
         if self.watch_enabled:
             self.start_watch()
 
     def enable_watch(self) -> None:
+        """Turn automatic mode on, save it and start watching."""
         self.watch_enabled = True
         self.persist_config()
         self.start_watch()
 
     def disable_watch(self) -> None:
+        """Turn automatic mode off, save it and stop watching."""
         self.watch_enabled = False
         self.persist_config()
         self._stop_watch()
 
     def _stop_watch(self) -> None:
+        """Cancel the polling timer and stop the worker thread."""
         if self._tick_job is not None:
             self.after_cancel(self._tick_job)
             self._tick_job = None
@@ -278,12 +312,14 @@ class App(ctk.CTk):
         self._set_watch_indicator()
 
     def _set_watch_indicator(self) -> None:
+        """Update the green/grey label that shows whether watching is on."""
         if self.watch_enabled:
             self.watch_state.configure(text=WATCH_STATE_ON, text_color="#27ae60")
         else:
             self.watch_state.configure(text=WATCH_STATE_OFF, text_color="grey")
 
     def tick(self) -> None:
+        """One polling cycle: scan the folder and show any resulting events."""
         self._tick_job = None
         if self.watcher is None:
             return
@@ -297,6 +333,7 @@ class App(ctk.CTk):
                 self._tick_job = self.after(POLL_INTERVAL_MS, self.tick)
 
     def _handle_event(self, event: WatcherEvent) -> None:
+        """Translate a watcher event into a coloured status message."""
         if event.kind == EVENT_SUCCESS:
             text = f"{WATCH_SUCCESS}{event.pdf or event.path}"
             color = "#27ae60"
@@ -314,16 +351,19 @@ class App(ctk.CTk):
         self.watch_status.configure(text=text, text_color=color)
 
     def on_include_antecedents_change(self) -> None:
+        """Forward the checkbox change to the running watcher, if any."""
         if self.watcher is not None:
             self.watcher.set_include_antecedents(
                 bool(self.include_antecedents.get())
             )
 
     def on_close(self) -> None:
+        """Stop background work before closing the window."""
         self._stop_watch()
         self.destroy()
 
     def convert(self) -> None:
+        """Convert the selected ZIP now (manual button) and report the result."""
         if not self.zip_path:
             self.status.configure(text=NO_ZIP, text_color="#c0392b")
             return
@@ -342,6 +382,7 @@ class App(ctk.CTk):
 
 
 def run() -> None:
+    """Configure the theme, create the main window and start the Tk loop."""
     ctk.set_appearance_mode("system")
     app = App()
     app.mainloop()
