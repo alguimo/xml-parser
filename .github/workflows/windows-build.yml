@@ -34,7 +34,12 @@ jobs:
           $version = "1.0.$($env:RUN_NUMBER)"
           $tag = "v$version"
 
-          python -c "from pathlib import Path; p = Path('app/version.py'); txt = p.read_text(encoding='utf-8'); p.write_text(txt.replace('APP_VERSION = \"1.0.0\"', f'APP_VERSION = \"{version}\"'), encoding='utf-8')"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $versionFile = Join-Path $PWD "app/version.py"
+          $content = [System.IO.File]::ReadAllText($versionFile, $utf8NoBom)
+          $updated = $content.Replace('APP_VERSION = "1.0.0"', "APP_VERSION = `"$version`"")
+          [System.IO.File]::WriteAllText($versionFile, $updated, $utf8NoBom)
+
           $stamped = python -c "from app.version import APP_VERSION; print(APP_VERSION)"
           if ($stamped.Trim() -ne $version) {
             Write-Error "Failed to stamp APP_VERSION: got '$stamped', expected '$version'"
@@ -93,10 +98,11 @@ jobs:
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: |
-          $installer = "dist/ConvertisseurWEDA-Setup.exe"
-          $checksum = "dist/ConvertisseurWEDA-Setup.exe.sha256"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $installer = Join-Path $PWD "dist/ConvertisseurWEDA-Setup.exe"
+          $checksum = Join-Path $PWD "dist/ConvertisseurWEDA-Setup.exe.sha256"
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
-          [System.IO.File]::WriteAllText($checksum, "$hash  ConvertisseurWEDA-Setup.exe`n")
+          [System.IO.File]::WriteAllText($checksum, "$hash  ConvertisseurWEDA-Setup.exe`n", $utf8NoBom)
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
