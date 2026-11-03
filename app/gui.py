@@ -7,10 +7,12 @@ settings; the real conversion is delegated to `conversion_service.convert_zip`
 
 from datetime import datetime
 from pathlib import Path
+import queue
+import sys
 from tkinter import filedialog, messagebox
+from typing import Optional
 
 import customtkinter as ctk
-from typing import Optional
 
 from app.config_store import AppConfig, load_config, save_config
 from app.conversion_service import convert_zip
@@ -24,6 +26,24 @@ from app.folder_watcher import (
     WatcherEvent,
     scan_zip_entries,
 )
+from app.icon import bundled_ico_path, create_app_image
+from app.single_instance import SingleInstanceGuard
+from app.startup import (
+    is_startup_enabled,
+    is_startup_supported,
+    set_startup_enabled,
+)
+from app.tray import TrayController
+from app.updater import (
+    INITIAL_CHECK_DELAY_MS,
+    PERIODIC_CHECK_INTERVAL_MS,
+    AutoUpdater,
+    launch_silent_installer,
+)
+from app.version import APP_VERSION
+
+UI_POLL_INTERVAL_MS = 250
+UPDATE_RETRY_DELAY_MS = 2000
 
 APP_TITLE = "Convertisseur ZIP en PDF"
 DROP_HINT = "Déposez un fichier ZIP ici"
@@ -34,6 +54,10 @@ CONVERT_LABEL = "Convertir"
 OUTPUT_FOLDER_LABEL = "Dossier de destination"
 WATCHED_FOLDER_LABEL = "Dossier surveillé"
 WATCH_TOGGLE_LABEL = "Conversion automatique"
+STARTUP_TOGGLE_LABEL = "Lancer au démarrage de Windows"
+STARTUP_ERROR = "Impossible de modifier le démarrage automatique :\n"
+VERSION_PREFIX = "Version"
+UPDATE_READY_HINT = "Mise à jour prête (s'installera en arrière-plan)"
 CHOOSE_LABEL = "Choisir…"
 CHOOSE_ZIP_TITLE = "Choisir le fichier ZIP (export WEDA)"
 CHOOSE_FOLDER_TITLE = "Choisir le dossier de destination"
@@ -88,7 +112,21 @@ class SettingsModal(ctk.CTkToplevel):
         )
         if master.watch_enabled:
             self.watch_toggle.select()
-        self.watch_toggle.pack(pady=(14, 6))
+        self.watch_toggle.pack(padx=24, pady=(14, 6))
+
+        self.startup_toggle = ctk.CTkCheckBox(
+            self, text=STARTUP_TOGGLE_LABEL, command=self._toggle_startup
+        )
+        if is_startup_supported():
+            if is_startup_enabled():
+                self.startup_toggle.select()
+        else:
+            self.startup_toggle.configure(state="disabled")
+        self.startup_toggle.pack(padx=24, pady=(4, 6))
+
+        ctk.CTkLabel(
+            self, text=f"{VERSION_PREFIX} {APP_VERSION}", text_color="grey"
+        ).pack(padx=24, pady=(4, 4))
 
         ctk.CTkButton(self, text="OK", command=self.destroy).pack(pady=(6, 20))
 
@@ -137,13 +175,34 @@ class SettingsModal(ctk.CTkToplevel):
             return
         self.master_app.enable_watch()
 
+    def _toggle_startup(self) -> None:
+        """Register or remove the per-user Windows auto-start entry."""
+        enabled = bool(self.startup_toggle.get())
+        try:
+            set_startup_enabled(enabled)
+        except OSError as exc:
+            if enabled:
+                self.startup_toggle.deselect()
+            else:
+                self.startup_toggle.select()
+            messagebox.showerror(APP_TITLE, f"{STARTUP_ERROR}{exc}")
+
 
 class App(ctk.CTk):
     """Main window: drop zone, options, status labels and action buttons."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        start_minimized: bool = False,
+        instance_guard: Optional[SingleInstanceGuard] = None,
+    ) -> None:
         super().__init__()
         self.title(APP_TITLE)
+        self._instance_guard = instance_guard
+        self._settings_modal: Optional[SettingsModal] = None
+        self._icon_photo = None
+        self._apply_window_icon()
+
         # Load remembered settings; default the output folder to the Desktop.
         config = load_config()
         self.output_dir = config.output_dir or (Path.home() / "Desktop")
@@ -152,6 +211,30 @@ class App(ctk.CTk):
         self.zip_path: Optional[str] = None
         self.watcher: Optional[FolderWatcher] = None
         self._tick_job: Optional[str] = None
+
+        self._ui_commands: queue.SimpleQueue[tuple[str, Optional[Path]]] = (
+            queue.SimpleQueue()
+        )
+        self._tray = TrayController(
+            on_open=lambda: self._ui_commands.put(("show", None)),
+            on_quit=lambda: self._ui_commands.put(("quit", None)),
+        )
+        self._tray.start()
+        self._ui_poll_job: Optional[str] = self.after(
+            UI_POLL_INTERVAL_MS, self._poll_background_signals
+        )
+
+        self.updating: bool = False
+        self._pending_installer: Optional[Path] = None
+        self._update_apply_job: Optional[str] = None
+        self._updater = AutoUpdater(
+            on_update_ready=lambda path: self._ui_commands.put(("update", path))
+        )
+        self._update_check_job: Optional[str] = None
+        if self._updater.supported:
+            self._update_check_job = self.after(
+                INITIAL_CHECK_DELAY_MS, self._run_update_check
+            )
 
         self.drop_zone = ctk.CTkButton(
             self,
@@ -205,6 +288,30 @@ class App(ctk.CTk):
         self.minsize(520, 300)
         self.resizable(True, True)
 
+        if start_minimized:
+            if self._tray.active:
+                self.withdraw()
+            else:
+                self.iconify()
+
+    def _apply_window_icon(self) -> None:
+        """Apply the application icon to the window titlebar and taskbar."""
+        if sys.platform == "win32":
+            ico = bundled_ico_path()
+            if ico is not None:
+                try:
+                    self.iconbitmap(str(ico))
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            from PIL import ImageTk
+
+            self._icon_photo = ImageTk.PhotoImage(create_app_image(64))
+            self.iconphoto(True, self._icon_photo)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _setup_drag_and_drop(self) -> None:
         """Enable drag & drop if tkinterdnd2 works; otherwise show a hint."""
         try:
@@ -239,8 +346,12 @@ class App(ctk.CTk):
         self.status.configure(text=path, text_color="grey")
 
     def open_settings(self) -> None:
-        """Open the settings modal window."""
-        SettingsModal(self)
+        """Open the settings modal window, or focus it if already open."""
+        if self._settings_modal is not None and self._settings_modal.winfo_exists():
+            self._settings_modal.lift()
+            self._settings_modal.focus_force()
+            return
+        self._settings_modal = SettingsModal(self)
 
     def persist_config(self) -> None:
         """Save the current folders and watch flag to disk."""
@@ -269,7 +380,12 @@ class App(ctk.CTk):
         self._stop_watch()
         self._set_watch_indicator()
         if self.watched_dir is None:
-            messagebox.showwarning(APP_TITLE, WATCH_DIR_REQUIRED)
+            if self.state() != "withdrawn":
+                messagebox.showwarning(APP_TITLE, WATCH_DIR_REQUIRED)
+            else:
+                self.watch_status.configure(
+                    text=WATCH_DIR_REQUIRED, text_color="#c0392b"
+                )
             return
         try:
             backlog = set(scan_zip_entries(self.watched_dir))
@@ -357,9 +473,126 @@ class App(ctk.CTk):
                 bool(self.include_antecedents.get())
             )
 
+    def _run_update_check(self) -> None:
+        """Trigger a non-blocking GitHub Release check and schedule the next one."""
+        self._update_check_job = None
+        self._updater.check_async()
+        if self.winfo_exists() and self._updater.supported:
+            self._update_check_job = self.after(
+                PERIODIC_CHECK_INTERVAL_MS, self._run_update_check
+            )
+
+    def _try_apply_pending_update(self) -> None:
+        """Install a staged update silently once the app is idle in the background."""
+        self._update_apply_job = None
+        installer = self._pending_installer
+        if installer is None or not installer.is_file():
+            return
+        if self.watcher is not None and self.watcher.is_busy:
+            self._update_apply_job = self.after(
+                UPDATE_RETRY_DELAY_MS, self._try_apply_pending_update
+            )
+            return
+        if self.state() not in ("withdrawn", "iconic"):
+            if not self.status.cget("text"):
+                self.status.configure(text=UPDATE_READY_HINT, text_color="grey")
+            return
+        if launch_silent_installer(installer):
+            self._pending_installer = None
+            self.quit_for_update()
+
+    def _poll_background_signals(self) -> None:
+        """Process tray menu commands, updater events and single-instance signals."""
+        self._ui_poll_job = None
+        action: Optional[str] = None
+        while True:
+            try:
+                cmd, payload = self._ui_commands.get_nowait()
+            except queue.Empty:
+                break
+            if cmd == "update" and payload is not None:
+                self._pending_installer = payload
+                self._try_apply_pending_update()
+                if not self.winfo_exists():
+                    return
+                continue
+            action = cmd
+            if cmd == "quit":
+                break
+
+        if action != "quit" and self._instance_guard is not None:
+            ext = self._instance_guard.poll_signal()
+            if ext is not None:
+                action = ext
+
+        if action == "quit":
+            self.quit_app()
+            return
+        if action == "show":
+            self.show_window()
+
+        if self.winfo_exists():
+            self._ui_poll_job = self.after(
+                UI_POLL_INTERVAL_MS, self._poll_background_signals
+            )
+
+    def hide_to_tray(self) -> None:
+        """Hide the main window into the system tray while keeping watchers alive."""
+        if self._settings_modal is not None and self._settings_modal.winfo_exists():
+            self._settings_modal.destroy()
+        self._settings_modal = None
+        self.withdraw()
+        if self._pending_installer is not None and self._update_apply_job is None:
+            self._update_apply_job = self.after(
+                300, self._try_apply_pending_update
+            )
+
+    def show_window(self) -> None:
+        """Restore the main window from the system tray or minimized state."""
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        if sys.platform == "win32":
+            self.attributes("-topmost", True)
+            self.after(120, self._clear_topmost)
+        self.focus_force()
+
+    def _clear_topmost(self) -> None:
+        """Release temporary topmost status used to raise the window on Windows."""
+        if self.winfo_exists():
+            self.attributes("-topmost", False)
+
     def on_close(self) -> None:
-        """Stop background work before closing the window."""
+        """Hide to the system tray if active; otherwise exit the application."""
+        if self._tray.active:
+            self.hide_to_tray()
+        else:
+            self.quit_app()
+
+    def _cancel_aux_timers(self) -> None:
+        """Cancel background UI and update timers before shutting down."""
+        for attr in ("_ui_poll_job", "_update_check_job", "_update_apply_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                self.after_cancel(job)
+                setattr(self, attr, None)
+
+    def quit_for_update(self) -> None:
+        """Exit cleanly for self-update, letting OS teardown release the mutex."""
+        self.updating = True
+        self._cancel_aux_timers()
         self._stop_watch()
+        self._tray.stop()
+        self.destroy()
+
+    def quit_app(self) -> None:
+        """Stop background work, remove the tray icon and close the application."""
+        self._cancel_aux_timers()
+        self._stop_watch()
+        self._tray.stop()
+        if self._instance_guard is not None:
+            self._instance_guard.release()
+            self._instance_guard = None
         self.destroy()
 
     def convert(self) -> None:
@@ -381,8 +614,12 @@ class App(ctk.CTk):
             messagebox.showerror(APP_TITLE, f"{CONVERT_KO}{exc}")
 
 
-def run() -> None:
+def run(
+    start_minimized: bool = False,
+    instance_guard: Optional[SingleInstanceGuard] = None,
+) -> bool:
     """Configure the theme, create the main window and start the Tk loop."""
     ctk.set_appearance_mode("system")
-    app = App()
+    app = App(start_minimized=start_minimized, instance_guard=instance_guard)
     app.mainloop()
+    return app.updating
