@@ -179,6 +179,11 @@ class FolderWatcher:
         """Update the checkbox setting used for future conversions."""
         self.include_antecedents = value
 
+    @property
+    def is_busy(self) -> bool:
+        """True while at least one ZIP is queued or actively converting."""
+        return bool(self._queued)
+
     def poll(self) -> None:
         """Scan the folder once and enqueue any new stable export ZIP.
 
