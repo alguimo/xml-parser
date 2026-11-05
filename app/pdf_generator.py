@@ -7,6 +7,7 @@ a single very tall row makes ReportLab's `splitInRow` return an empty top part
 and retry forever, so we control page breaks ourselves.
 """
 
+import html
 import os
 import tempfile
 from datetime import date
@@ -172,12 +173,17 @@ def _styles() -> dict[str, ParagraphStyle]:
     }
 
 
+def _esc(text: str) -> str:
+    """Escape plain text so ReportLab's XML paragraph parser never treats `<` or `&` as markup."""
+    return html.escape(text, quote=False)
+
+
 def _table(
     data: list[list], headers: list[str], styles: dict, widths=None
 ) -> Table:
     """Build a styled table with a header row repeated on every page."""
-    rows = [[Paragraph(f"<b>{h}</b>", styles["table_header"]) for h in headers]]
-    rows += [[Paragraph(str(c), styles["small"]) for c in row] for row in data]
+    rows = [[Paragraph(f"<b>{_esc(h)}</b>", styles["table_header"]) for h in headers]]
+    rows += [[Paragraph(_esc(str(c)), styles["small"]) for c in row] for row in data]
     table = Table(rows, colWidths=widths, repeatRows=1)
     table.setStyle(
         TableStyle(
@@ -201,7 +207,7 @@ def _patient_blocks(p: PatientData, styles: dict) -> list[Paragraph]:
     for key, label in LABELS.items():
         value = getattr(p, key, "")
         if value:
-            rows.append([Paragraph(f"<b>{label}</b>", styles["body"]), Paragraph(value, styles["body"])])
+            rows.append([Paragraph(f"<b>{_esc(label)}</b>", styles["body"]), Paragraph(_esc(value), styles["body"])])
     if not rows:
         return []
     table = Table(rows, colWidths=[MAIN_WIDTH * 0.42, MAIN_WIDTH * 0.58])
@@ -210,22 +216,22 @@ def _patient_blocks(p: PatientData, styles: dict) -> list[Paragraph]:
 
 def _antecedent_entry(ant: Antecedent, styles: dict) -> list:
     """Lay out one history entry: bold "Label — CIM10" plus an indented comment."""
-    heading = ant.label
+    heading = _esc(ant.label)
     if ant.cim10:
-        heading += f'{ENTRY_SEPARATOR}<font color="{ACCENT_MID}">{ant.cim10}</font>'
+        heading += f'{ENTRY_SEPARATOR}<font color="{ACCENT_MID}">{_esc(ant.cim10)}</font>'
     if ant.comment:
         heading += " :"
     blocks = [Paragraph(heading, styles["entry_bold"])]
     if ant.comment:
-        blocks.append(Paragraph(ant.comment, styles["entry_text"]))
+        blocks.append(Paragraph(_esc(ant.comment), styles["entry_text"]))
     return blocks
 
 
 def _prescription_entry(rx: Prescription, styles: dict) -> list:
     """Lay out one medication: bold name plus an indented dosage line."""
-    blocks = [Paragraph(rx.name, styles["entry_bold"])]
+    blocks = [Paragraph(_esc(rx.name), styles["entry_bold"])]
     if rx.dosage:
-        blocks.append(Paragraph(rx.dosage, styles["entry_text"]))
+        blocks.append(Paragraph(_esc(rx.dosage), styles["entry_text"]))
     return blocks
 
 
@@ -245,7 +251,7 @@ def _antecedent_blocks(antecedents: list[Antecedent], styles: dict) -> list:
         categories[idx][1].append(ant)
 
     for category, items in categories:
-        blocks.append(Paragraph(category.upper(), styles["group"]))
+        blocks.append(Paragraph(_esc(category.upper()), styles["group"]))
         for ant in items:
             blocks.extend(_antecedent_entry(ant, styles))
     return blocks
@@ -262,7 +268,7 @@ def _treatment_blocks(record: PatientRecord, styles: dict) -> list:
         return [Paragraph(NO_PRESCRIPTIONS, styles["body"])]
     blocks: list = []
     for consult in consult_with_rx:
-        blocks.append(Paragraph(consult.date, styles["group"]))
+        blocks.append(Paragraph(_esc(consult.date), styles["group"]))
         for rx in consult.prescriptions:
             blocks.extend(_prescription_entry(rx, styles))
     return blocks
@@ -291,16 +297,16 @@ def _consultation_blocks(record: PatientRecord, styles: dict) -> list:
         if not entries:
             continue
         if show_groups and kind != kinds[0]:
-            blocks.append(Paragraph(GROUP_LABELS.get(kind, kind), styles["sub"]))
+            blocks.append(Paragraph(_esc(GROUP_LABELS.get(kind, kind)), styles["sub"]))
         for c in entries:
             heading = f"{c.date} — {c.kind}"
             if c.user:
                 heading += f" ({c.user})"
-            blocks.append(Paragraph(heading, styles["sub"]))
+            blocks.append(Paragraph(_esc(heading), styles["sub"]))
 
             for section_title, text in c.sections:
                 if section_title:
-                    blocks.append(Paragraph(section_title, styles["body"]))
+                    blocks.append(Paragraph(_esc(section_title), styles["body"]))
                 for line in text.split("\n"):
                     blocks.append(Paragraph(line, styles["body"]))
 
@@ -329,7 +335,7 @@ def _consultation_blocks(record: PatientRecord, styles: dict) -> list:
                 blocks.append(Spacer(1, 2))
                 blocks.append(Paragraph(ATTACHMENTS_TITLE, styles["body"]))
                 for name in c.attachments:
-                    blocks.append(Paragraph(f"• {name}", styles["small"]))
+                    blocks.append(Paragraph(f"• {_esc(name)}", styles["small"]))
 
             blocks.append(Spacer(1, 6))
     return blocks
@@ -491,7 +497,7 @@ def generate_pdf(
 
         # Left (wide) column: patient title, patient data, then consultations.
         main: list = [
-            Paragraph(p.full_name or p.last_name, styles["title"]),
+            Paragraph(_esc(p.full_name or p.last_name), styles["title"]),
             Spacer(1, 6),
         ]
         if patient_blocks:
